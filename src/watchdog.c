@@ -28,15 +28,26 @@
 #include <time.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/sem.h>
 #include <ipc_config.h>
 #include <func_defs.h>
 #include <stdbool.h>
 
+union semun {
+	int val;
+	struct semid_ds *buf;
+	unsigned short *array;
+};
+
 #define TIMEOUT 3 // heartBeat가 오는 주기, 이 주기보다 늦으면 오류
+
+int g_shmid = -1;
+int g_semid = -1;
+sensor_shm_data_t *g_shm = NULL;
+
 
 time_t last_hb_time; // heartBeat주기를 알기 위한 heartBeat가 마지막으로 온 시간
 pid_t controller_pid; // controller의 pid
-char watchdog_pid_str[16]; // pid 문자열을 저장할 버퍼 선언
 
 void heartBeatHandler(int sig); 
 // heartBeat가 왔는지 안왔는지 갱신해주고, last_hb_time를 갱신하는 함수 
@@ -45,19 +56,38 @@ void setupSignalHandler(void);
 // heartBeatHandler와 역할을 분리
 void performRecovery(void);
 // controller를 강제 종료하고, 정리, 새 프로세스 시작, 프로그램 시작 수행 함수
+void setupIPC(void);
+void waitForControllerPID(void);
+
 
 int main() {
-	printf("--- Watchdog process started ---"); 
+	printf("--- Watchdog process started ---\n");
+	
+    // 1. IPC 연결 및 PID 교환
+    setupIPC(); 
+    waitForControllerPID();
+
+    // 2. 시그널 핸들러 설정
 	setupSignalHandler();
-	last_hb_time = time(NULL);
+
+    // 3. 감시 루프
+	last_hb_time = time(NULL); // 초기 Heartbeat 시간 설정
 	unsigned int sleepTime;
+    
 	for(;;) {
-		// cpu부담을 줄이기 위한 sleep, TIMEOUT보다 작아야 한다
-		if((sleepTime = sleep(2)) < 2) perror("sleep interupt error -- Watchdog");
-		// 시그널이 온 시간이 timeout보다 작을때, 즉 오류가 생겼다고 판단될 시
-		// performRecovery를 실행
-		if(time(NULL) - last_hb_time > TIMEOUT) performRecovery();
-	} 
+		// CPU 부담을 줄이기 위한 sleep
+		if((sleepTime = sleep(2)) < 2) {
+            // 시그널 인터럽트 발생 시 (정상 Heartbeat 수신 시)
+            // perror 대신 간단히 무시하거나 로그를 남기는 것이 좋음
+        }
+
+		// 타임아웃 검사
+		if(time(NULL) - last_hb_time > TIMEOUT) {
+            performRecovery();
+        }
+	}
+    // shmdt(g_shm); // 프로세스가 종료될 때 자동으로 분리되지만 명시적으로 호출할 수도 있음
+	return 0;
 }
 
 void heartBeatHandler(int sig) {
@@ -72,35 +102,107 @@ void setupSignalHandler(void) {
 	sigemptyset(&act.sa_mask);
 	act.sa_flags = 0;
 	//sigaction 호출
-	if((sigaction(SIGUSR1, &act, NULL)) < 0) perror("sigaction error -- Watchdog");
+	if((sigaction(SIGUSR1, &act, NULL)) < 0){
+		perror("sigaction error -- Watchdog");
+		exit(EXIT_FAILURE);
+	}
+}
+
+void setupIPC(void) {
+	struct sembuf p_buf, v_buf;
+	p_buf.sem_num = 0;
+	p_buf.sem_op = -1;
+	p_buf.sem_flg = 0;
+
+	v_buf.sem_num = 0;
+	v_buf.sem_op = 1;
+	v_buf.sem_flg = 0;
+
+	// 1. 공유 메모리 연결
+	if ((g_shmid = shmget(SHM_KEY_SENSOR, sizeof(sensor_shm_data_t), 0666)) < 0){
+		perror("[Watchdog] shmget error");
+		exit(EXIT_FAILURE);
+	}
+
+	if ((g_shm = shmat(g_shmid, NULL, 0)) == (void *)-1){
+		perror("[Watchdog] shmat error");
+		exit(EXIT_FAILURE);
+	}
+
+	// 2. 세마포어 연결
+	if ((g_semid = semget(SEM_KEY_SYNC, 1, 0666)) < 0) {
+		perror("[Watchdog] semget error");
+		exit(EXIT_FAILURE);
+	}
+	
+	// 3. 자신의 PID 기록 (Controller가 Heartbeat 대상을 알도록)
+    if (semop(g_semid, &p_buf, 1) < 0) { perror("[Watchdog] semop P failed"); exit(EXIT_FAILURE); }
+    g_shm->watchdog_pid = getpid();
+    if (semop(g_semid, &v_buf, 1) < 0) { perror("[Watchdog] semop V failed"); exit(EXIT_FAILURE); }
+    
+    printf("[Watchdog] PID %d recorded in SHM.\n", getpid());
+}
+
+void waitForControllerPID(void) {
+    struct sembuf p_buf, v_buf;
+    p_buf.sem_num = 0;
+	p_buf.sem_op = -1;
+	p_buf.sem_flg = 0; // Lock
+   
+	v_buf.sem_num = 0;
+	v_buf.sem_op = 1;  
+	v_buf.sem_flg = 0;  // Unlock
+    
+    printf("[Watchdog] Waiting for Controller to start and record its PID...\n");
+    
+    while (1) {
+        if (semop(g_semid, &p_buf, 1) < 0) { perror("[Watchdog] semop P failed"); exit(EXIT_FAILURE); }
+        
+        controller_pid = g_shm->controller_pid;
+        
+        if (semop(g_semid, &v_buf, 1) < 0) { perror("[Watchdog] semop V failed"); exit(EXIT_FAILURE); }
+        
+        if (controller_pid > 0) {
+            printf("[Watchdog] Controller PID %d received. Monitoring started.\n", controller_pid);
+            break;
+        }
+        sleep(1); // 1초 대기 후 다시 시도
+    }
 }
 
 void performRecovery(void) {
 	pid_t newControllerPid;
-	pid_t currentWatchdogPid;
-	currentWatchdogPid = getpid();
-	sprintf(watchdog_pid_str, "%d", currentWatchdogPid);
+	
+    printf("\n[Watchdog] Recovery initiated! (Controller PID: %d unresponsive)\n", controller_pid);
 
 	char *const argv[] = {
 		(char *)"./controller",
-		(char *)watchdog_pid_str,
-		(char *)NULL
+		(char *)NULL // Controller가 Watchdog PID를 SHM에서 읽어가므로 인자 불필요
 	};
 
-	// controller 종료
-	if((kill(controller_pid, SIGKILL) < 0)) perror("kill error -- Watchdog");
-	// 종료되어서 중지 상태가 된 자식(controller)을 회수 후 반환.
-	if((waitpid(controller_pid, NULL, 0)) < 0) perror("waitpid error -- Watchdog");
+	// 1. Controller 강제 종료
+	if((kill(controller_pid, SIGKILL) < 0)) perror("[Watchdog] kill error");
+    
+	// 2. 종료된 자식 회수 (좀비 프로세스 정리)
+	if((waitpid(controller_pid, NULL, 0)) < 0) perror("[Watchdog] waitpid error");
 	
-	// controller 프로세스 재시작
+	// 3. 새 Controller 프로세스 재시작
 	if((newControllerPid = fork()) < 0) {
-		perror("fork error -- Watchdog");
+		perror("[Watchdog] fork error");
 	} else if (newControllerPid == 0) {
+		// 자식 프로세스: 새로운 Controller 실행
+		printf("[Watchdog] Relaunching Controller...\n");
 		execv("./controller", argv);
 
-		perror("execv failed -- Watchdog");
+		// execv 실패 시
+		perror("[Watchdog] execv failed");
 		exit(EXIT_FAILURE);
 	} else {
+		// 부모 프로세스: 새로운 Controller의 PID 갱신
 		controller_pid = newControllerPid;
+        printf("[Watchdog] New Controller PID: %d\n", controller_pid);
+        
+        // ⭐️ 중요: last_hb_time 갱신하여 즉시 재복구 방지
+        last_hb_time = time(NULL); 
 	}
 }
