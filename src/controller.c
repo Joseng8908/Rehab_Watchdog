@@ -17,6 +17,10 @@
  * 시간 주기: timeout
  */
 
+/*
+* 동시성 처리해야함
+*/
+
 #include "ipc_config.h"
 #include <signal.h>
 #include <stdio.h>
@@ -31,22 +35,23 @@
 #define WARN_LOW 5
 #define WARN_HIGH 65
 
-int main() {
+int main(int argc, char *argv[]) {
 
   // 1. 공유 메모리 연결
   int shmid = shmget(SHM_KEY_SENSOR, sizeof(sensor_shm_data_t), 0666);
   sensor_shm_data_t *shm = shmat(shmid, NULL, 0);
 
-  // 2. Controller PID 기록
-  shm->controller_pid = getpid();
-
-  // 3. Watchdog PID 읽기
-  pid_t wpid = shm->watchdog_pid;
+  // 2. Watchdog PID 읽기
+  if (argc < 2) {
+		fprintf(stderr, "Controller: Watchdog PID sargument missing.\n");
+		exit(EXIT_FAILURE);
+	}
+	pid_t wpid = (pid_t)atoi(argv[1]);
 
   while (1) {
     double angle = shm->joint_angle;
 
-    // --- 4. 임계값 검사 ---
+    // --- 3. 임계값 검사 ---
     if (angle >= NORMAL_LOW && angle <= NORMAL_HIGH) {
       shm->is_safe = 0; // 정상
     } else if ((angle >= WARN_LOW && angle < NORMAL_LOW) ||
@@ -56,7 +61,7 @@ int main() {
       shm->is_safe = -1; // 비정상
     }
 
-    // --- 5. 에러 상태일 때 heartbeat 중단 ---
+    // --- 4. 에러 상태일 때 heartbeat 중단 ---
     if (shm->is_safe != -1) {
       kill(wpid, SIGUSR1); // heartbeat 전송
     }
